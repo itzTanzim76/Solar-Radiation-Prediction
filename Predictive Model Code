@@ -1,0 +1,281 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import math, warnings
+warnings.filterwarnings("ignore")
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import GRU, Dense, Dropout, Bidirectional
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+# ==============================
+# CONFIG
+# ==============================
+SEQ_LEN = 60                # history length (days)
+OUT_LEN = 61                # forecast horizon (Aug+Sep = 31 + 30)
+TRAIN_CUTOFFS = [           # walk-forward eval cutoffs (Yend<=cutoff=train; (cutoff, next] = val)
+    '2023-06-30',
+    '2023-12-31',
+    '2024-06-30',
+    '2024-12-31'
+]
+FINAL_TRAIN_CUTOFF = '2025-07-31'  # train up to end of July 2025, then forecast Aug+Sep
+AUG_START, SEP_END = '2025-08-01', '2025-09-30'
+EPS = 1e-6
+
+# ==============================
+# LOAD & PREP DATA
+# ==============================
+df = pd.read_csv("2020-2025.csv")
+df['Date'] = pd.to_datetime(dict(year=df['YEAR'], month=df['MO'], day=df['DY']))
+df = df[['Date','ALLSKY_SFC_SW_DWN']].rename(columns={'ALLSKY_SFC_SW_DWN':'Radiation'})
+df = df.set_index('Date').sort_index()
+
+# Calendars
+df['doy'] = df.index.dayofyear
+df['dow'] = df.index.dayofweek
+df['sin_doy'] = np.sin(2*np.pi*df['doy']/365.25)
+df['cos_doy'] = np.cos(2*np.pi*df['doy']/365.25)
+df['sin_dow'] = np.sin(2*np.pi*df['dow']/7.0)
+df['cos_dow'] = np.cos(2*np.pi*df['dow']/7.0)
+
+# Climatology (train years only 2020–2024)
+clim_train = df.loc['2020-01-01':'2024-12-31']
+clim = clim_train.groupby('doy')['Radiation'].agg(['mean','std']).rename(columns={'mean':'mu','std':'sigma'})
+clim['sigma'] = clim['sigma'].fillna(clim['sigma'].median())
+clim['sigma'] = clim['sigma'].replace(0, clim['sigma'].median())
+df = df.join(clim, on='doy')
+
+# Anomaly target
+df['z'] = (df['Radiation'] - df['mu']) / (df['sigma'] + EPS)
+
+# Lag & rolling features (shift by 1 to avoid leakage)
+def add_lags_rolls(frame, col='z'):
+    frame[f'{col}_lag1']  = frame[col].shift(1)
+    frame[f'{col}_lag7']  = frame[col].shift(7)
+    frame[f'{col}_lag30'] = frame[col].shift(30)
+    frame[f'{col}_ma7']   = frame[col].rolling(7).mean().shift(1)
+    frame[f'{col}_ma14']  = frame[col].rolling(14).mean().shift(1)
+    frame[f'{col}_ma30']  = frame[col].rolling(30).mean().shift(1)
+    return frame
+
+df = add_lags_rolls(df, 'z')
+df[['z_lag1','z_lag7','z_lag30','z_ma7','z_ma14','z_ma30']] = df[['z_lag1','z_lag7','z_lag30','z_ma7','z_ma14','z_ma30']].fillna(0.0)
+
+# Feature set
+FEATURE_COLS = [
+    'z', 'z_lag1', 'z_lag7', 'z_lag30', 'z_ma7', 'z_ma14', 'z_ma30',
+    'sin_doy','cos_doy','sin_dow','cos_dow'
+]
+features = df[FEATURE_COLS].copy()
+
+# Arrays aligned
+z_arr     = df['z'].values
+mu_arr    = df['mu'].values
+sigma_arr = df['sigma'].values
+F_all     = features.values
+dates     = df.index
+
+# ==============================
+# SEQUENCE BUILDER
+# ==============================
+def make_sequences(F, z, mu, sigma, seq_len=60, out_len=61):
+    X, Yz, MU, SIG, YEND = [], [], [], [], []
+    n = len(z)
+    for i in range(n - seq_len - out_len + 1):
+        X.append(F[i:i+seq_len])
+        Yz.append(z[i+seq_len:i+seq_len+out_len])
+        MU.append(mu[i+seq_len:i+seq_len+out_len])
+        SIG.append(sigma[i+seq_len:i+seq_len+out_len])
+        YEND.append(i + seq_len + out_len - 1)
+    return np.array(X), np.array(Yz), np.array(MU), np.array(SIG), np.array(YEND)
+
+# ==============================
+# MODEL FACTORY
+# ==============================
+def build_model(input_dim, out_len):
+    model = Sequential([
+        Bidirectional(GRU(64, return_sequences=True, activation='tanh'), input_shape=(SEQ_LEN, input_dim)),
+        Dropout(0.2),
+        Bidirectional(GRU(32, activation='tanh')),
+        Dropout(0.2),
+        Dense(out_len)
+    ])
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+# ==============================
+# WALK-FORWARD BACKTEST
+# ==============================
+def backtest(F, z, mu, sigma, dates, cutoffs, seq_len=60, out_len=61):
+    # Fit scaler on data up to EACH CUTOFF, evaluate on window until next cutoff
+    metrics = []
+    for i, cutoff in enumerate(cutoffs):
+        cutoff = pd.Timestamp(cutoff)
+        next_cutoff = pd.Timestamp(cutoffs[i+1]) if i+1 < len(cutoffs) else cutoff + pd.Timedelta(days=366)
+
+        # Fit scaler only on features up to cutoff
+        train_mask_scaler = (dates <= cutoff)
+        scaler = StandardScaler().fit(F[train_mask_scaler])
+
+        F_scaled = scaler.transform(F)
+
+        # Build sequences on ALL data (then slice by YEND)
+        X, Yz, MU, SIG, YEND = make_sequences(F_scaled, z, mu, sigma, seq_len, out_len)
+        # Map YEND to date index
+        yend_dates = dates[YEND]
+
+        # Train windows: YEND <= cutoff
+        tr = (yend_dates <= cutoff)
+        # Val windows: (cutoff, next_cutoff]
+        va = (yend_dates > cutoff) & (yend_dates <= next_cutoff)
+
+        X_tr, y_tr = X[tr], Yz[tr]
+        X_va, y_va, MU_va, SIG_va = X[va], Yz[va], MU[va], SIG[va]
+
+        if len(X_tr) == 0 or len(X_va) == 0:
+            print(f"Backtest window {cutoff.date()} → {next_cutoff.date()} skipped (insufficient data).")
+            continue
+
+        model = build_model(X.shape[-1], out_len)
+        bs = min(16, len(X_tr))
+        cb = [
+            EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
+            ReduceLROnPlateau(monitor='val_loss', patience=3, factor=0.5, min_lr=1e-5, verbose=0)
+        ]
+        model.fit(X_tr, y_tr, epochs=40, batch_size=bs, validation_split=0.1, callbacks=cb, verbose=0)
+
+        y_pred_z = model.predict(X_va, verbose=0, batch_size=1)
+        # Reconstruct to real units
+        y_pred = y_pred_z * (SIG_va + EPS) + MU_va
+        y_true = y_va     * (SIG_va + EPS) + MU_va
+
+        mse = mean_squared_error(y_true.flatten(), y_pred.flatten())
+        rmse = math.sqrt(mse)
+        mae = mean_absolute_error(y_true.flatten(), y_pred.flatten())
+        metrics.append({'cutoff': str(cutoff.date()), 'MSE': mse, 'RMSE': rmse, 'MAE': mae})
+        print(f"Backtest cutoff {cutoff.date()} — RMSE: {rmse:.3f}, MAE: {mae:.3f}")
+    return pd.DataFrame(metrics)
+
+# ==============================
+# RUN BACKTEST (for accuracy measurement)
+# ==============================
+bt_metrics = backtest(F_all, z_arr, mu_arr, sigma_arr, dates, TRAIN_CUTOFFS, SEQ_LEN, OUT_LEN)
+if len(bt_metrics):
+    print("\nBacktest summary (walk-forward):")
+    print(bt_metrics)
+    print("\nAveraged:", {
+        'MSE':  bt_metrics['MSE'].mean(),
+        'RMSE': bt_metrics['RMSE'].mean(),
+        'MAE':  bt_metrics['MAE'].mean()
+    })
+else:
+    print("\nNo backtest windows produced metrics (adjust TRAIN_CUTOFFS or OUT_LEN).")
+
+# ==============================
+# FINAL TRAIN ON ALL DATA UP TO FINAL_TRAIN_CUTOFF
+# ==============================
+final_cutoff = pd.Timestamp(FINAL_TRAIN_CUTOFF)
+
+# Fit scaler on features up to final cutoff
+scaler_final = StandardScaler().fit(F_all[dates <= final_cutoff])
+F_scaled = scaler_final.transform(F_all)
+
+# Build sequences & mask to keep only windows ending <= cutoff for training
+X_all, Yz_all, MU_all, SIG_all, YEND_all = make_sequences(F_scaled, z_arr, mu_arr, sigma_arr, SEQ_LEN, OUT_LEN)
+yend_dates_all = dates[YEND_all]
+train_mask_final = (yend_dates_all <= final_cutoff)
+
+X_trf, y_trf = X_all[train_mask_final], Yz_all[train_mask_final]
+
+# Train final model
+final_model = build_model(X_all.shape[-1], OUT_LEN)
+bs_final = min(16, len(X_trf)) if len(X_trf) > 0 else 1
+cb_final = [
+    EarlyStopping(monitor='val_loss', patience=6, restore_best_weights=True),
+    ReduceLROnPlateau(monitor='val_loss', patience=3, factor=0.5, min_lr=1e-5, verbose=0)
+]
+history = final_model.fit(
+    X_trf, y_trf,
+    epochs=100, batch_size=bs_final,
+    validation_split=0.1 if len(X_trf) > 20 else 0.0,
+    callbacks=cb_final, verbose=1
+)
+
+plt.figure(figsize=(8,4))
+plt.plot(history.history['loss'], label='Train')
+if 'val_loss' in history.history:
+    plt.plot(history.history['val_loss'], label='Val')
+plt.legend(); plt.title('Final Model Loss'); plt.tight_layout(); plt.show()
+
+# ==============================
+# FORECAST AUG+SEP 2025
+# ==============================
+# last SEQ_LEN days ending at FINAL_TRAIN_CUTOFF
+end_idx = df.index.get_loc(final_cutoff)
+X_last = F_scaled[end_idx-SEQ_LEN+1:end_idx+1].reshape(1, SEQ_LEN, -1)
+
+pred_z = final_model.predict(X_last, verbose=0)[0]
+
+# Reconstruct using climatology for actual target days
+forecast_index = pd.date_range(AUG_START, SEP_END, freq='D')
+doy_fore = forecast_index.dayofyear
+mu_fore  = clim.loc[doy_fore, 'mu'].values
+sig_fore = clim.loc[doy_fore, 'sigma'].values
+forecast_raw = pred_z * (sig_fore + EPS) + mu_fore
+
+# ==============================
+# QUANTILE MAPPING CORRECTION (per month)
+# ==============================
+def quantile_map(series_pred, ref_series):
+    """Map predicted series to the empirical distribution of the reference series via rank-based mapping."""
+    if len(ref_series) < 5:
+        return series_pred  # not enough refs; skip
+    ref_sorted = np.sort(ref_series.values.astype(float))
+    ranks = series_pred.argsort().argsort()  # 0..n-1 ranks
+    qs = (ranks + 0.5) / len(series_pred)    # quantiles
+    ref_q = np.quantile(ref_sorted, qs, interpolation='linear')
+    # Preserve predicted order but match ref quantiles
+    order = np.argsort(series_pred)
+    corrected = np.empty_like(series_pred, dtype=float)
+    corrected[order] = ref_q
+    return corrected
+
+# Build reference distributions for Aug and Sep from 2020–2024
+ref_aug = df.loc['2020-08-01':'2024-08-31', 'Radiation']
+ref_sep = df.loc['2020-09-01':'2024-09-30', 'Radiation']
+
+aug_mask = (forecast_index.month == 8)
+sep_mask = (forecast_index.month == 9)
+
+aug_corr = quantile_map(forecast_raw[aug_mask].copy(), ref_aug)
+sep_corr = quantile_map(forecast_raw[sep_mask].copy(), ref_sep)
+
+forecast_corrected = forecast_raw.copy()
+forecast_corrected[aug_mask] = aug_corr
+forecast_corrected[sep_mask] = sep_corr
+
+# ==============================
+# OUTPUTS
+# ==============================
+forecast_df = pd.DataFrame({
+    'Date': forecast_index,
+    'Raw_GRU_AnomalyForecast': forecast_raw,
+    'QuantileMapped_Corrected': forecast_corrected
+})
+print("\nForecast (first 10 rows):")
+print(forecast_df.head(10))
+
+forecast_df.to_csv("aug_sep_2025_forecast_gru_bidir_anomaly_quantilemap.csv", index=False)
+
+# Plot history + forecasts
+plt.figure(figsize=(14,5))
+plt.plot(df['Radiation'], label='Historical')
+plt.plot(forecast_df['Date'], forecast_df['Raw_GRU_AnomalyForecast'], 'orange', linestyle='--', label='Raw Forecast (Aug+Sep 2025)')
+plt.plot(forecast_df['Date'], forecast_df['QuantileMapped_Corrected'], 'red', label='Corrected Forecast (Quantile Mapped)')
+plt.axvline(pd.to_datetime(FINAL_TRAIN_CUTOFF), color='gray', linestyle='--')
+plt.legend(); plt.title("Daily Solar Radiation — Aug & Sep 2025 (BiGRU + Anomaly + Quantile Mapping)")
+plt.tight_layout(); plt.show()
